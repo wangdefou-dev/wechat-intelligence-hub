@@ -204,6 +204,21 @@ class IntelligenceViewTests(unittest.TestCase):
         self.assertGreater(metadata["freshness_hours"], 2)
         self.assertIn("暂不解读环比", text)
 
+    def test_brief_accepts_timezone_aware_database_timestamps(self) -> None:
+        self.insert(
+            [message("品牌方A", "品牌方A", "2026-08-02T11:30:00+08:00", "方便确认报价吗？")]
+        )
+
+        text, metadata = intelligence_views.brief_report(
+            self.conn,
+            hours=24,
+            now=datetime(2026, 8, 2, 12, 0, 0),
+        )
+
+        self.assertEqual(metadata["messages"], 1)
+        self.assertAlmostEqual(metadata["freshness_hours"], 0.5)
+        self.assertIn("最新索引距现在约 0.5 小时", text)
+
     def test_brief_does_not_compare_windows_with_uneven_coverage(self) -> None:
         rows = [
             message("旧群", "A", "2026-08-01 10:00:00", "旧窗口消息"),
@@ -479,6 +494,37 @@ class IntelligenceViewTests(unittest.TestCase):
         self.assertNotIn("服务通知", names)
         self.assertNotIn("朋友A", names)
         self.assertIn("品牌联系人B", names)
+
+    def test_contact_daily_accepts_timezone_aware_database_timestamps(self) -> None:
+        self.insert(
+            [
+                message(
+                    "品牌联系人时区",
+                    "品牌联系人时区",
+                    "2026-08-02T10:00:00+08:00",
+                    "方便确认一下报价吗？",
+                )
+            ]
+        )
+
+        original_profile = radar.ACTIVE_PROFILE
+        radar.ACTIVE_PROFILE = radar.merge_profile(
+            radar.DEFAULT_PROFILE,
+            {"labels": {"priority": ["重点客户"], "commercial": ["重点客户"]}},
+        )
+        try:
+            rows = radar.build_contact_daily_rows(
+                self.conn,
+                "2026-08-02 00:00:00",
+                "2026-08-03 00:00:00",
+                {"品牌联系人时区": {"重点客户"}},
+                ["创作者A"],
+            )
+        finally:
+            radar.ACTIVE_PROFILE = original_profile
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["状态"], "待回复")
 
     def test_contact_daily_surfaces_open_promise_from_before_current_window(self) -> None:
         self.insert(

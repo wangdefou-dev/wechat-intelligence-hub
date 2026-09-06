@@ -1990,7 +1990,7 @@ def profile_init_command(args: argparse.Namespace) -> None:
             labels[key] = list(dict.fromkeys(item.strip() for item in argument if item.strip()))
 
     profile["context"] = {
-        "setup_status": "ready" if all_context_paths and labels.get("priority") else "needs_context",
+        "setup_status": "ready" if personal_paths and plan_paths and labels.get("priority") else "needs_context",
         "personal_documents": [str(path) for path in personal_paths],
         "current_plan_documents": [str(path) for path in plan_paths],
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -5043,11 +5043,22 @@ def brief_command(args: argparse.Namespace) -> None:
     db_path = Path(args.db).expanduser()
     if not db_path.exists():
         raise SystemExit(f"找不到数据库：{db_path}")
+    current = parse_time_for_filter(args.until) if args.until else datetime.now()
+    current = current or datetime.now()
+    hours = float(args.hours)
+    if args.since:
+        since_dt = parse_time_for_filter(args.since)
+        if not since_dt:
+            raise SystemExit(f"无法识别开始时间：{args.since}")
+        hours = (current - since_dt).total_seconds() / 3600
+        if hours <= 0:
+            raise SystemExit("开始时间不能晚于结束时间")
     conn = connect_readonly_radar_db(str(db_path))
     text, metadata = brief_report(
         conn,
-        hours=args.hours,
+        hours=hours,
         limit_chats=args.limit_chats,
+        now=current,
         self_names=configured_self_names(args.self_name),
     )
     conn.close()
@@ -5056,7 +5067,7 @@ def brief_command(args: argparse.Namespace) -> None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(text, encoding="utf-8")
         print(
-            f"近 {args.hours} 小时：{metadata['messages']} 条消息，{metadata['chats']} 个会话，"
+            f"近 {hours:g} 小时：{metadata['messages']} 条消息，{metadata['chats']} 个会话，"
             f"{metadata['opportunities']} 个新近商机"
         )
         print(f"输出文件：{out_path}")
@@ -5119,7 +5130,9 @@ def find_open_contact_promise(
             """
             select sender, time, content
             from messages
-            where chat = ? and time >= ? and time <= ?
+            where chat = ?
+              and replace(substr(time, 1, 19), 'T', ' ') >= ?
+              and replace(substr(time, 1, 19), 'T', ' ') <= ?
             order by time asc
             """,
             (chat, history_since, until),
@@ -5160,7 +5173,8 @@ def build_contact_daily_rows(
         """
         select chat, sender, time, content, source_file
         from messages
-        where time >= ? and time <= ?
+        where replace(substr(time, 1, 19), 'T', ' ') >= ?
+          and replace(substr(time, 1, 19), 'T', ' ') <= ?
         order by time asc
         """,
         (since, until),
@@ -7196,6 +7210,8 @@ def build_parser() -> argparse.ArgumentParser:
     brief_parser = subparsers.add_parser("brief", help="生成微信个人情报简报，并与前一等长窗口比较")
     brief_parser.add_argument("--db", default=DEFAULT_RADAR_DB, help="本地微信情报库 SQLite 路径")
     brief_parser.add_argument("--hours", type=int, default=24, help="当前窗口小时数，默认 24")
+    brief_parser.add_argument("--since", help="明确指定时间起点；提供后覆盖 --hours")
+    brief_parser.add_argument("--until", help="时间终点；默认当前时间")
     brief_parser.add_argument("--limit-chats", type=int, default=10, help="私聊和群聊各最多展开多少个")
     brief_parser.add_argument("--self-name", action="append", help="补充你的微信发送者名字，可重复；默认读取 Profile")
     brief_parser.add_argument("--out", help="输出 Markdown 文件")

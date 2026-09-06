@@ -737,7 +737,8 @@ def _window_messages(conn: sqlite3.Connection, since: str, until: str, limit: in
             """
             select chat, sender, time, content, source_file
             from messages
-            where time >= ? and time < ?
+            where replace(substr(time, 1, 19), 'T', ' ') >= ?
+              and replace(substr(time, 1, 19), 'T', ' ') < ?
             order by time asc
             limit ?
             """,
@@ -749,7 +750,7 @@ def _window_messages(conn: sqlite3.Connection, since: str, until: str, limit: in
 def brief_report(
     conn: sqlite3.Connection,
     *,
-    hours: int = 24,
+    hours: float = 24,
     limit_chats: int = 10,
     now: datetime | None = None,
     self_names: Iterable[str] = ("我", "me", "自己"),
@@ -769,7 +770,14 @@ def brief_report(
     freshness_hours: float | None = None
     if latest_db_time:
         try:
-            freshness_hours = max(0.0, (current - datetime.fromisoformat(latest_db_time)).total_seconds() / 3600)
+            latest_db_dt = datetime.fromisoformat(latest_db_time)
+            current_for_freshness = current
+            if latest_db_dt.tzinfo is not None and latest_db_dt.utcoffset() is not None:
+                if current_for_freshness.tzinfo is None or current_for_freshness.utcoffset() is None:
+                    current_for_freshness = current_for_freshness.astimezone()
+            elif current_for_freshness.tzinfo is not None and current_for_freshness.utcoffset() is not None:
+                current_for_freshness = current_for_freshness.replace(tzinfo=None)
+            freshness_hours = max(0.0, (current_for_freshness - latest_db_dt).total_seconds() / 3600)
         except ValueError:
             pass
 

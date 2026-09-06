@@ -60,6 +60,15 @@ class AccessOnboardingTests(unittest.TestCase):
         with self.assertRaisesRegex(access.AccessError, "account_selection"):
             access.check_root(self.db)
 
+    def test_provider_account_root_normalizes_reader_database_root(self):
+        self.assertEqual(access.provider_account_root(self.db), self.root)
+        self.assertEqual(access.provider_account_root(self.root), self.root)
+
+        container = self.root / "accounts"
+        account = container / "only-account"
+        (account / "db_storage").mkdir(parents=True)
+        self.assertEqual(access.provider_account_root(container), account)
+
     def test_no_confirmation_never_executes(self):
         args = self.args()
         args.confirm_side_effects = False
@@ -91,14 +100,31 @@ class AccessOnboardingTests(unittest.TestCase):
         self.assertEqual(args.config.read_text(), "existing")
 
     def test_provider_output_is_suppressed(self):
-        state = access.bounded_provider([sys.executable, "-c", "print('PRIVATE MATERIAL'); raise SystemExit(3)"], {}, 5)
-        self.assertEqual(state, "provider_failed")
+        result = access.bounded_provider([sys.executable, "-c", "print('PRIVATE MATERIAL'); raise SystemExit(3)"], {}, 5)
+        self.assertEqual(result, {"state": "provider_failed", "diagnostic_code": "provider_failed_unclassified"})
+        self.assertNotIn("PRIVATE MATERIAL", json.dumps(result))
+
+    def test_provider_output_is_reduced_to_allowlisted_diagnostic(self):
+        result = access.bounded_provider([
+            sys.executable, "-c",
+            "print('secret=' + 'a' * 64); print('No PBKDF calls were observed'); raise SystemExit(3)",
+        ], {}, 5)
+        self.assertEqual(result, {"state": "provider_failed", "diagnostic_code": "pbkdf_no_calls"})
+        self.assertNotIn("a" * 64, json.dumps(result))
+
+    def test_provider_target_launch_failure_is_classified_without_raw_output(self):
+        result = access.bounded_provider([
+            sys.executable, "-c",
+            "print('private root=/Users/example'); print('launch failed: operation not permitted'); raise SystemExit(3)",
+        ], {}, 5)
+        self.assertEqual(result, {"state": "provider_failed", "diagnostic_code": "pbkdf_target_launch_failed"})
+        self.assertNotIn("/Users/example", json.dumps(result))
 
     @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
     def test_provider_timeout_is_bounded(self):
         started = time.monotonic()
-        state = access.bounded_provider([sys.executable, "-c", "import time; time.sleep(30)"], {}, 1)
-        self.assertEqual(state, "provider_timeout_cleanup_required")
+        result = access.bounded_provider([sys.executable, "-c", "import time; time.sleep(30)"], {}, 1)
+        self.assertEqual(result, {"state": "provider_timeout_cleanup_required"})
         self.assertLess(time.monotonic() - started, 6)
 
     def test_connect_failure_does_not_leave_keys_or_config(self):
@@ -127,13 +153,15 @@ class AccessOnboardingTests(unittest.TestCase):
              mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(self.root), pw_name="testuser", pw_gid=os.getgid())), \
              mock.patch.object(access.subprocess, "run", return_value=SimpleNamespace(stdout="")), \
              mock.patch.object(access.os, "chown"), \
-             mock.patch.object(access, "bounded_provider", return_value="provider_finished") as invoke, \
+             mock.patch.object(access, "bounded_provider", return_value={"state": "provider_finished"}) as invoke, \
              mock.patch.dict(os.environ, {"WXKEY_BOOTSTRAP_ORIGINAL_WECHAT": "1", "SECRET_PASSWORD": "must-not-pass"}):
             self.assertEqual(access.worker(args), 0)
         env = invoke.call_args.args[1]
+        provider_argv = invoke.call_args.args[0]
         self.assertEqual(env["WXKEY_NO_ELEVATE"], "1")
         self.assertNotIn("WXKEY_BOOTSTRAP_ORIGINAL_WECHAT", env)
         self.assertNotIn("SECRET_PASSWORD", env)
+        self.assertEqual(provider_argv[-2:], ["--root", str(self.root)])
         self.assertEqual(json.loads((run_dir / "worker-result.json").read_text()), {"state": "provider_finished"})
 
     def test_encrypted_connect_publishes_only_verified_generation(self):

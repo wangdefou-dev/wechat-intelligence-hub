@@ -56,6 +56,17 @@ def check_root(root: Path) -> Path:
     return root
 
 
+def provider_account_root(root: Path) -> Path:
+    """Translate Reader database roots to wxkey's account-root contract."""
+    root = check_root(root)
+    if root.name == "db_storage":
+        return root.parent
+    if (root / "db_storage").is_dir():
+        return root
+    accounts = [path.parent for path in root.glob("*/db_storage") if path.is_dir()]
+    return accounts[0] if len(accounts) == 1 else root
+
+
 def inspect(provider: Path, expected: str, root: Path) -> dict:
     digest = provider_digest(provider)
     check_root(root)
@@ -73,24 +84,70 @@ def inspect(provider: Path, expected: str, root: Path) -> dict:
     }
 
 
-def bounded_provider(argv: list[str], env: dict[str, str], timeout: int) -> str:
-    """Suppress provider output; stop its process group, never an arbitrary PID."""
-    process = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               start_new_session=True)
-    try:
-        code = process.wait(timeout=timeout)
-        return "provider_finished" if code == 0 else "provider_failed"
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGTERM)
+PROVIDER_DIAGNOSTICS = {
+    "lldb_unavailable",
+    "pbkdf_breakpoint_unavailable",
+    "pbkdf_derivation_incompatible",
+    "pbkdf_no_calls",
+    "pbkdf_root_mismatch",
+    "pbkdf_target_launch_failed",
+    "pbkdf_timeout",
+    "process_attach_denied",
+    "shadow_launch_failed",
+    "shadow_open_failed",
+    "shadow_prepare_failed",
+    "wechat_not_ready",
+    "provider_failed_unclassified",
+}
+
+
+def classify_provider_failure(output: bytes) -> str:
+    """Reduce private provider output to one allowlisted diagnostic code."""
+    text = output.decode("utf-8", errors="replace").lower()
+    signatures = (
+        ("no pbkdf calls were observed", "pbkdf_no_calls"),
+        ("none of its salts matched this db root", "pbkdf_root_mismatch"),
+        ("matched local db salts, but no derived key verified", "pbkdf_derivation_incompatible"),
+        ("cckeyderivationpbkdf breakpoint did not resolve", "pbkdf_breakpoint_unavailable"),
+        ("lldb python path unavailable", "lldb_unavailable"),
+        ("lldb python path is empty", "lldb_unavailable"),
+        ("pbkdf fallback failed: timed out", "pbkdf_timeout"),
+        ("launch failed:", "pbkdf_target_launch_failed"),
+        ("shadow wechat did not start", "shadow_launch_failed"),
+        ("open shadow wechat:", "shadow_open_failed"),
+        ("prepare shadow wechat:", "shadow_prepare_failed"),
+        ("wechat is not ready yet", "wechat_not_ready"),
+        ("task_for_pid denied", "process_attach_denied"),
+    )
+    return next((code for signature, code in signatures if signature in text),
+                "provider_failed_unclassified")
+
+
+def bounded_provider(argv: list[str], env: dict[str, str], timeout: int) -> dict:
+    """Keep provider output private and return only an allowlisted diagnosis."""
+    with tempfile.TemporaryFile() as capture:
+        process = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                                   stdout=capture, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
         try:
-            process.wait(timeout=3)
+            code = process.wait(timeout=timeout)
+            if code == 0:
+                return {"state": "provider_finished"}
+            capture.seek(0, os.SEEK_END)
+            size = capture.tell()
+            capture.seek(max(0, size - 1024 * 1024))
+            return {"state": "provider_failed",
+                    "diagnostic_code": classify_provider_failure(capture.read())}
         except subprocess.TimeoutExpired:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-        return "provider_timeout_cleanup_required"
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            return {"state": "provider_timeout_cleanup_required"}
 
 
 def worker(args: argparse.Namespace) -> int:
@@ -111,6 +168,7 @@ def worker(args: argparse.Namespace) -> int:
     if source.exists():
         raise AccessError("provider_config_exists_use_connect")
     root = check_root(args.database_root)
+    acquisition_root = provider_account_root(root)
     # The reviewed provider can quit WeChat globally. Refuse shared-user runs.
     processes = subprocess.run(["/bin/ps", "-axo", "uid=,comm="], capture_output=True, text=True, check=True).stdout
     for line in processes.splitlines():
@@ -123,13 +181,15 @@ def worker(args: argparse.Namespace) -> int:
         "WXKEY_NO_ELEVATE": "1", "WXKEY_ELEVATED": "1",
         "WXKEY_SETUP_TIMEOUT": "180s", "WXKEY_PBKDF_PROBE_TIMEOUT": "180s",
     }
-    state = bounded_provider([str(args.provider), "bootstrap", "--root", str(root)], env, args.timeout)
+    result = bounded_provider(
+        [str(args.provider), "bootstrap", "--root", str(acquisition_root)], env, args.timeout
+    )
     # Exclusive creation avoids replacing any existing recovery result.
     fd = os.open(str(run_dir / "worker-result.json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump({"state": state}, handle)
+        json.dump(result, handle)
     os.chown(run_dir / "worker-result.json", args.uid, owner.pw_gid)
-    return 0 if state == "provider_finished" else 1
+    return 0 if result["state"] == "provider_finished" else 1
 
 
 def connect(source: Path | None, root: Path, config: Path, max_files: int = 500) -> dict:
@@ -229,10 +289,14 @@ def run(args: argparse.Namespace) -> dict:
         result_file = run_dir / "worker-result.json"
         if not result_file.is_file():
             raise AccessError("authorization_or_worker_failed_review_required")
-        state = json.loads(result_file.read_text(encoding="utf-8"))["state"]
+        worker_result = json.loads(result_file.read_text(encoding="utf-8"))
+        state = worker_result["state"]
         if state not in {"provider_finished", "provider_failed", "provider_timeout_cleanup_required"}:
             raise AccessError("worker_result_invalid")
         if authorization.returncode != 0 or state != "provider_finished":
+            diagnostic = worker_result.get("diagnostic_code")
+            if state == "provider_failed" and diagnostic in PROVIDER_DIAGNOSTICS:
+                raise AccessError(f"{state}:{diagnostic}")
             raise AccessError(state)
         if not source.is_file() or source.stat().st_uid != os.getuid():
             raise AccessError("provider_material_owner_invalid")

@@ -129,6 +129,31 @@ class ProfileTests(unittest.TestCase):
         self.assertTrue(rows[0]["法律科技"])
         self.assertEqual(rows[0]["建议关注级别"], "重点")
 
+    def test_profile_init_requires_personal_and_current_plan_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            personal = root / "personal.md"
+            profile_path = root / "profile.json"
+            report_path = root / "setup.md"
+            personal.write_text("个人背景和长期目标。", encoding="utf-8")
+            parser = radar.build_parser()
+            args = parser.parse_args(
+                [
+                    "profile-init",
+                    "--out", str(profile_path),
+                    "--report", str(report_path),
+                    "--personal-doc", str(personal),
+                    "--priority-label", "重点客户",
+                ]
+            )
+
+            args.func(args)
+            payload = json.loads(profile_path.read_text(encoding="utf-8"))
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(payload["context"]["setup_status"], "needs_context")
+        self.assertIn("当前计划", report_text)
+
     def test_profile_force_update_preserves_existing_context_documents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

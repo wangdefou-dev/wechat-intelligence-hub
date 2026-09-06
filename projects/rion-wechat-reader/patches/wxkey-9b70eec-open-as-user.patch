@@ -1,0 +1,156 @@
+diff --git a/cmd/wxkey/main.go b/cmd/wxkey/main.go
+index 752f079..4090157 100644
+--- a/cmd/wxkey/main.go
++++ b/cmd/wxkey/main.go
+@@ -1167,7 +1167,7 @@ func prepareShadowWeChat() (int, func(), error) {
+ 	}
+ 
+ 	fmt.Println("[INFO] Opening wechat-cli WeChat shadow copy...")
+-	if err := exec.Command("/usr/bin/open", "-n", shadowPath).Run(); err != nil {
++	if _, err := combinedOutputAsInvokingUser("/usr/bin/open", "-n", shadowPath); err != nil {
+ 		return 0, nil, fmt.Errorf("open shadow WeChat: %w", err)
+ 	}
+ 	pid, err := waitForWeChatPIDUnderApp(shadowPath, 90*time.Second)
+@@ -1182,7 +1182,7 @@ func prepareShadowWeChat() (int, func(), error) {
+ 		_ = exec.Command("/bin/kill", "-TERM", strconv.Itoa(pid)).Run()
+ 		time.Sleep(1 * time.Second)
+ 		if hadWeChatRunning && !envTrue("WXKEY_NO_REOPEN_ORIGINAL_WECHAT") {
+-			_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
++			_, _ = combinedOutputAsInvokingUser("/usr/bin/open", wechatAppPath)
+ 		}
+ 	}
+ 	return pid, cleanup, nil
+@@ -1276,11 +1276,11 @@ func ensureWeChatReady(root string, pid int, timeout time.Duration) error {
+ 	if pid == 0 {
+ 		if pids, _ := wechatPIDs(); len(pids) == 0 {
+ 			fmt.Println("[INFO] Opening WeChat...")
+-			_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
++			_, _ = combinedOutputAsInvokingUser("/usr/bin/open", wechatAppPath)
+ 		}
+ 	} else if !pidAlive(pid) {
+ 		fmt.Println("[INFO] Opening WeChat...")
+-		_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
++		_, _ = combinedOutputAsInvokingUser("/usr/bin/open", wechatAppPath)
+ 	}
+ 	for {
+ 		readyPID := false
+@@ -1564,6 +1564,20 @@ func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
+ 	}
+ 
+ 	timeout := pbkdfProbeTimeout()
++	uid, gid, ok := invokingUserIDs()
++	if !ok || uid == 0 {
++		return nil, fmt.Errorf("PBKDF fallback requires a verified non-root invoking user")
++	}
++	home := effectiveUserHome()
++	user := strings.TrimSpace(os.Getenv("WXKEY_ORIG_USER"))
++	if user == "" {
++		if owner, lookupErr := userpkg.LookupId(strconv.Itoa(uid)); lookupErr == nil {
++			user = owner.Username
++		}
++	}
++	if user == "" {
++		return nil, fmt.Errorf("PBKDF fallback could not resolve the invoking user name")
++	}
+ 	args := []string{
+ 		"PYTHONPATH=" + lldbPyPath,
+ 		"/usr/bin/python3", scriptPath,
+@@ -1571,6 +1585,10 @@ func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
+ 		"--root", root,
+ 		"--out", outPath,
+ 		"--timeout", strconv.Itoa(int(timeout.Seconds())),
++		"--uid", strconv.Itoa(uid),
++		"--gid", strconv.Itoa(gid),
++		"--home", home,
++		"--user", user,
+ 	}
+ 	if envTrue("WXKEY_PBKDF_EARLY_STOP") {
+ 		args = append(args, "--early-stop")
+@@ -1674,7 +1692,7 @@ func reopenOriginalWeChatAfterPBKDF() {
+ 	if envTrue("WXKEY_NO_REOPEN_ORIGINAL_WECHAT") {
+ 		return
+ 	}
+-	_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
++	_, _ = combinedOutputAsInvokingUser("/usr/bin/open", wechatAppPath)
+ }
+ 
+ func pbkdfProbeTimeout() time.Duration {
+@@ -1927,8 +1945,16 @@ def main():
+     ap.add_argument("--root", required=True)
+     ap.add_argument("--out", required=True)
+     ap.add_argument("--timeout", type=float, default=90)
++    ap.add_argument("--uid", type=int, required=True)
++    ap.add_argument("--gid", type=int, required=True)
++    ap.add_argument("--home", required=True)
++    ap.add_argument("--user", required=True)
+     ap.add_argument("--early-stop", action="store_true")
+     args = ap.parse_args()
++    if args.uid <= 0 or args.gid < 0:
++        raise RuntimeError("invalid invoking user identity")
++    if not os.path.isabs(args.home) or not os.path.isdir(args.home):
++        raise RuntimeError("invalid invoking user home")
+     dbs, salt_to_db, macsalt_to_db = build_db_maps(args.root)
+     debugger = lldb.SBDebugger.Create()
+     debugger.SetAsync(False)
+@@ -1938,9 +1964,19 @@ def main():
+     bp = target.BreakpointCreateByName("CCKeyDerivationPBKDF")
+     if not bp.IsValid() or bp.GetNumLocations() == 0:
+         raise RuntimeError("CCKeyDerivationPBKDF breakpoint did not resolve")
+-    process = target.Launch(lldb.SBLaunchInfo([]), lldb.SBError())
++    launch_info = lldb.SBLaunchInfo([])
++    launch_info.SetUserID(args.uid)
++    launch_info.SetGroupID(args.gid)
++    launch_info.SetEnvironmentEntries([
++        "HOME=" + args.home,
++        "USER=" + args.user,
++        "LOGNAME=" + args.user,
++        "CFFIXED_USER_HOME=" + args.home,
++    ], True)
++    launch_error = lldb.SBError()
++    process = target.Launch(launch_info, launch_error)
+     if not process.IsValid():
+-        raise RuntimeError("launch failed")
++        raise RuntimeError("launch failed: " + str(launch_error))
+     found = {}
+     seen = set()
+     counters = {"hits": 0, "kdf_256k_salt_hits": 0, "mac_kdf_salt_hits": 0, "stops": 0, "found": 0, "early_stop": 0}
+@@ -2697,7 +2733,7 @@ func runResignWeChat() {
+ 	fmt.Println("      WeChat signature is ad-hoc.")
+ 
+ 	fmt.Println("[4/4] Reopening WeChat...")
+-	if err := exec.Command("/usr/bin/open", wechatAppPath).Run(); err != nil {
++	if _, err := combinedOutputAsInvokingUser("/usr/bin/open", wechatAppPath); err != nil {
+ 		fmt.Fprintf(os.Stderr, "[WARN] open WeChat failed: %v\n", err)
+ 		fmt.Fprintln(os.Stderr, "       Ask the user to open WeChat manually and wait for login; then the agent should run `wxkey setup`.")
+ 		return
+diff --git a/cmd/wxkey/main_test.go b/cmd/wxkey/main_test.go
+index 10b2733..a436150 100644
+--- a/cmd/wxkey/main_test.go
++++ b/cmd/wxkey/main_test.go
+@@ -339,6 +339,26 @@ func TestPBKDFProbeTargetSupportsExplicitApp(t *testing.T) {
+ 	}
+ }
+ 
++func TestPBKDFProbeLaunchesAsInvokingUser(t *testing.T) {
++	wants := []string{
++		`ap.add_argument("--uid", type=int, required=True)`,
++		`ap.add_argument("--gid", type=int, required=True)`,
++		`ap.add_argument("--home", required=True)`,
++		`ap.add_argument("--user", required=True)`,
++		"launch_info.SetUserID(args.uid)",
++		"launch_info.SetGroupID(args.gid)",
++		`"HOME=" + args.home`,
++		`"USER=" + args.user`,
++		`"CFFIXED_USER_HOME=" + args.home`,
++		"target.Launch(launch_info, launch_error)",
++	}
++	for _, want := range wants {
++		if !strings.Contains(pbkdfProbePython, want) {
++			t.Fatalf("PBKDF probe is missing invoking-user launch setting %q", want)
++		}
++	}
++}
++
+ func TestConfigHasImageKey(t *testing.T) {
+ 	if configHasImageKey(wxcliConfig{ImageKey: "   "}) {
+ 		t.Fatalf("blank image key should not be ready")
